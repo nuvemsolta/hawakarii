@@ -173,6 +173,7 @@ local Window = Library:CreateWindow({
 })
 
 Window:SetSidebarWidth(152)
+Library.CantDragForced = true
 Library:UpdateColorsUsingRegistry()
 
 if Library.IsMobile then
@@ -255,38 +256,54 @@ local State = {
 
     Targeting = {
         Enabled = false,
-        TargetClass = "Monsters",
+        TargetClass = "Universal",
         TargetPart = "Auto",
         ModelTopOffset = 0.32,
 
+        -- Universal discovery
+        UniversalScan = true,
+        ScanRadius = 3000,
+        ScanInterval = 0.45,
+        CustomModelMaxSize = 220,
+        CustomModelMaxParts = 450,
+        PreferLivingTargets = true,
+
         -- Acquisition
-        FOV = 165,
+        FOV = 230,
         TargetPriority = "Crosshair",
-        MaxLockDistance = 2500,
+        MaxLockDistance = 3500,
         WallCheck = true,
         TeamCheck = true,
-        StrictPart = true,
+        StrictPart = false,
+        RequireOnScreenForAcquire = true,
 
-        -- Real lock behaviour
+        -- Lock behaviour
         LockMode = "Hard",
-        Smoothness = 0.22,
+        Smoothness = 0.32,
         StickyLock = true,
+        StickyThroughWalls = true,
         AutoLock = true,
         AutoReacquire = true,
+        ReacquireDelay = 0.08,
 
-        -- Optional motion compensation. Disabled by default so "Hard" aims
-        -- exactly at the selected BasePart position.
+        -- Target offsets
+        AimOffsetX = 0,
+        AimOffsetY = 0,
+        AimOffsetZ = 0,
+
+        -- Motion compensation
         Prediction = false,
         PredictionTime = 0.08,
 
-        -- Desktop can still use RMB if desired. Mobile never requires it.
-        HoldRightMouse = not UIS.TouchEnabled,
+        -- Desktop/mouse hold optional. Mobile never requires it.
+        HoldRightMouse = false,
         ShowFOV = true,
+        ShowLockMarker = true,
 
         -- Touch controls
         MobileControls = true,
         MobileDockScale = 1.0,
-        TapToLock = false,
+        TapToLock = true,
     },
 
     Freecam = {
@@ -3907,6 +3924,39 @@ task.spawn(function()
     end
 end)
 
+--========================================================
+-- AIM LATE-SPAWN RECOVERY
+--========================================================
+
+connect(Workspace.DescendantAdded, function(object)
+    if not State.Running
+        or not State.Targeting.Enabled then
+        return
+    end
+
+    if object:IsA("Humanoid")
+        or object:IsA("AnimationController")
+        or object:IsA("Bone")
+        or object:IsA("Attachment") then
+
+        local model =
+            object:
+            FindFirstAncestorOfClass(
+                "Model"
+            )
+
+        if model then
+            task.delay(0.05, function()
+                if State.Running
+                    and model.Parent then
+                    TargetAssist:
+                        RegisterCandidate(model)
+                end
+            end)
+        end
+    end
+end)
+
 -- PLAYER RESPAWN / PLAYER ENTITY TRACKING
 --========================================================
 
@@ -5819,12 +5869,24 @@ end)
 local TargetAssist = {
     Gui = nil,
     Circle = nil,
+    LockMarker = nil,
+    LockMarkerLabel = nil,
+
+    Candidates = setmetatable({}, { __mode = "k" }),
+    CandidateCount = 0,
+    LastUniversalScan = 0,
 
     CurrentModel = nil,
     CurrentPart = nil,
     CurrentClass = nil,
 
     LastAcquire = 0,
+
+    Stats = {
+        Scans = 0,
+        Locks = 0,
+        CandidatesSeen = 0,
+    },
 
     MobileGui = nil,
     MobileDock = nil,
@@ -5869,8 +5931,46 @@ function TargetAssist:EnsureGui()
     stroke.Thickness = 1.4
     stroke.Parent = circle
 
+    local marker = Instance.new("Frame")
+    marker.Name = "LockMarker"
+    marker.AnchorPoint = Vector2.new(0.5, 0.5)
+    marker.Size = UDim2.fromOffset(34, 34)
+    marker.BackgroundTransparency = 1
+    marker.Visible = false
+    marker.Parent = gui
+
+    local markerStroke = Instance.new("UIStroke")
+    markerStroke.Color = Color3.fromRGB(190, 120, 255)
+    markerStroke.Thickness = 2
+    markerStroke.Transparency = 0.08
+    markerStroke.Parent = marker
+
+    local markerCorner = Instance.new("UICorner")
+    markerCorner.CornerRadius = UDim.new(1, 0)
+    markerCorner.Parent = marker
+
+    local markerLabel = Instance.new("TextLabel")
+    markerLabel.AnchorPoint = Vector2.new(0.5, 0)
+    markerLabel.Position = UDim2.new(0.5, 0, 1, 5)
+    markerLabel.Size = UDim2.fromOffset(190, 24)
+    markerLabel.BackgroundColor3 = Color3.fromRGB(15, 16, 24)
+    markerLabel.BackgroundTransparency = 0.14
+    markerLabel.BorderSizePixel = 0
+    markerLabel.Text = "LOCK"
+    markerLabel.TextColor3 = Color3.fromRGB(242, 240, 255)
+    markerLabel.TextSize = 11
+    markerLabel.Font = Enum.Font.GothamBold
+    markerLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    markerLabel.Parent = marker
+
+    local labelCorner = Instance.new("UICorner")
+    labelCorner.CornerRadius = UDim.new(0, 7)
+    labelCorner.Parent = markerLabel
+
     self.Gui = gui
     self.Circle = circle
+    self.LockMarker = marker
+    self.LockMarkerLabel = markerLabel
 end
 
 function TargetAssist:MobileConnect(signal, callback)
@@ -6213,27 +6313,546 @@ function TargetAssist:Destroy()
     self.CurrentClass = nil
 end
 
+
+--========================================================
+-- UNIVERSAL AIM CANDIDATE ENGINE
+--========================================================
+
+function TargetAssist:HasTagUpwards(model, tags)
+    local current = model
+
+    for _ = 1, 5 do
+        if not current or current == Workspace then
+            break
+        end
+
+        for _, tag in ipairs(tags) do
+            if CollectionService:HasTag(current, tag) then
+                return true
+            end
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
+function TargetAssist:HasTrueAttributeUpwards(model, names)
+    local current = model
+
+    for _ = 1, 5 do
+        if not current or current == Workspace then
+            break
+        end
+
+        for _, name in ipairs(names) do
+            if current:GetAttribute(name) == true then
+                return true
+            end
+        end
+
+        current = current.Parent
+    end
+
+    return false
+end
+
+function TargetAssist:GetModelMetrics(model)
+    local ok, boxCf, boxSize =
+        pcall(function()
+            return model:GetBoundingBox()
+        end)
+
+    if not ok or not boxCf or not boxSize then
+        return nil
+    end
+
+    local parts = 0
+    local anchored = 0
+    local bones = 0
+    local attachments = 0
+    local meshParts = 0
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("BasePart") then
+            parts += 1
+
+            if object:IsA("MeshPart") then
+                meshParts += 1
+            end
+
+            if object.Anchored then
+                anchored += 1
+            end
+
+        elseif object:IsA("Bone") then
+            bones += 1
+
+        elseif object:IsA("Attachment") then
+            attachments += 1
+        end
+
+        if parts > State.Targeting.CustomModelMaxParts then
+            break
+        end
+    end
+
+    return {
+        CFrame = boxCf,
+        Size = boxSize,
+        Parts = parts,
+        Anchored = anchored,
+        Bones = bones,
+        Attachments = attachments,
+        MeshParts = meshParts,
+        MaxAxis = math.max(
+            boxSize.X,
+            boxSize.Y,
+            boxSize.Z
+        ),
+    }
+end
+
+function TargetAssist:ClassifyUniversalModel(model)
+    if not model
+        or not model:IsA("Model")
+        or not model.Parent
+        or model == LocalPlayer.Character then
+        return nil
+    end
+
+    local player =
+        Players:GetPlayerFromCharacter(model)
+
+    if player then
+        return "PLAYER"
+    end
+
+    local known =
+        classifyEntity(model)
+
+    if known then
+        return known
+    end
+
+    if self:HasTagUpwards(
+        model,
+        { "Monster", "Enemy", "Boss" }
+    ) or self:HasTrueAttributeUpwards(
+        model,
+        {
+            "Monster", "IsMonster",
+            "Enemy", "IsEnemy",
+            "Boss", "IsBoss",
+            "Hostile",
+        }
+    ) then
+        return "MONSTER"
+    end
+
+    if self:HasTagUpwards(
+        model,
+        { "NPC" }
+    ) or self:HasTrueAttributeUpwards(
+        model,
+        { "NPC", "IsNPC" }
+    ) then
+        return "NPC"
+    end
+
+    if self:HasTagUpwards(
+        model,
+        { "Entity", "Character", "Target" }
+    ) or self:HasTrueAttributeUpwards(
+        model,
+        {
+            "Entity", "IsEntity",
+            "Targetable",
+        }
+    ) then
+        return "ENTITY"
+    end
+
+    local metrics =
+        self:GetModelMetrics(model)
+
+    if not metrics
+        or metrics.Parts <= 0
+        or metrics.Parts > State.Targeting.CustomModelMaxParts
+        or metrics.MaxAxis > State.Targeting.CustomModelMaxSize then
+        return nil
+    end
+
+    local animationController =
+        model:FindFirstChildOfClass(
+            "AnimationController"
+        )
+
+    local animator =
+        model:
+        FindFirstChildWhichIsA(
+            "Animator",
+            true
+        )
+
+    local movingParts =
+        metrics.Parts - metrics.Anchored
+
+    if metrics.Bones > 0
+        or metrics.Attachments > 0
+        or animationController
+        or animator
+        or movingParts > 0 then
+
+        return "CUSTOM"
+    end
+
+    return nil
+end
+
+function TargetAssist:GetCandidateModelFromPart(part)
+    if not part then
+        return nil
+    end
+
+    local current = part.Parent
+    local fallback = nil
+
+    for _ = 1, 10 do
+        if not current
+            or current == Workspace then
+            break
+        end
+
+        if current:IsA("Model") then
+            fallback = current
+
+            local class =
+                self:
+                ClassifyUniversalModel(
+                    current
+                )
+
+            if class then
+                return current, class
+            end
+        end
+
+        current = current.Parent
+    end
+
+    if fallback then
+        local class =
+            self:
+            ClassifyUniversalModel(
+                fallback
+            )
+
+        return fallback, class
+    end
+
+    return nil
+end
+
+function TargetAssist:RegisterCandidate(model, class)
+    if not model
+        or not model:IsA("Model")
+        or not model.Parent
+        or model == LocalPlayer.Character then
+        return false
+    end
+
+    class =
+        class
+        or self:
+            ClassifyUniversalModel(model)
+
+    if not class then
+        return false
+    end
+
+    local existing =
+        self.Candidates[model]
+
+    if existing then
+        existing.Class = class
+        existing.LastSeen = os.clock()
+        return false
+    end
+
+    self.Candidates[model] = {
+        Model = model,
+        Class = class,
+        LastSeen = os.clock(),
+    }
+
+    self.CandidateCount += 1
+    self.Stats.CandidatesSeen += 1
+
+    return true
+end
+
+function TargetAssist:RemoveCandidate(model)
+    if not self.Candidates[model] then
+        return
+    end
+
+    self.Candidates[model] = nil
+
+    self.CandidateCount =
+        math.max(
+            0,
+            self.CandidateCount - 1
+        )
+end
+
+function TargetAssist:RefreshKnownCandidates()
+    for _, player in ipairs(
+        Players:GetPlayers()
+    ) do
+        if player ~= LocalPlayer
+            and player.Character then
+
+            self:RegisterCandidate(
+                player.Character,
+                "PLAYER"
+            )
+        end
+    end
+
+    local tagged = {
+        { "Monster", "MONSTER" },
+        { "Enemy", "MONSTER" },
+        { "Boss", "MONSTER" },
+        { "NPC", "NPC" },
+        { "Entity", "ENTITY" },
+        { "Character", "ENTITY" },
+        { "Target", "ENTITY" },
+    }
+
+    for _, pair in ipairs(tagged) do
+        for _, object in ipairs(
+            CollectionService:
+            GetTagged(pair[1])
+        ) do
+            local model =
+                object:IsA("Model")
+                and object
+                or object:
+                    FindFirstAncestorOfClass(
+                        "Model"
+                    )
+
+            if model then
+                self:RegisterCandidate(
+                    model,
+                    pair[2]
+                )
+            end
+        end
+    end
+end
+
+function TargetAssist:ScanUniversal(force)
+    if not State.Targeting.UniversalScan
+        and not force then
+        return 0
+    end
+
+    local now = os.clock()
+
+    if not force
+        and now - self.LastUniversalScan
+            < State.Targeting.ScanInterval then
+        return 0
+    end
+
+    self.LastUniversalScan = now
+    self.Stats.Scans += 1
+
+    self:RefreshKnownCandidates()
+
+    local root = Character:GetRoot()
+    Camera = Workspace.CurrentCamera
+
+    local center =
+        root
+        and root.Position
+        or (
+            Camera
+            and Camera.CFrame.Position
+            or Vector3.zero
+        )
+
+    local params = OverlapParams.new()
+    params.FilterType =
+        Enum.RaycastFilterType.Exclude
+
+    params.FilterDescendantsInstances = {
+        LocalPlayer.Character,
+    }
+
+    params.MaxParts = 4200
+
+    local parts = {}
+
+    local ok =
+        pcall(function()
+            parts =
+                Workspace:
+                GetPartBoundsInRadius(
+                    center,
+                    State.Targeting.ScanRadius,
+                    params
+                )
+        end)
+
+    if not ok then
+        return 0
+    end
+
+    local added = 0
+    local seen = {}
+
+    for index, part in ipairs(parts) do
+        local model, class =
+            self:
+            GetCandidateModelFromPart(
+                part
+            )
+
+        if model
+            and not seen[model] then
+
+            seen[model] = true
+
+            if self:RegisterCandidate(
+                model,
+                class
+            ) then
+                added += 1
+            end
+        end
+
+        if index % 850 == 0 then
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    local remove = {}
+
+    for model, data in pairs(
+        self.Candidates
+    ) do
+        if not model.Parent then
+            table.insert(remove, model)
+        else
+            local class =
+                self:
+                ClassifyUniversalModel(
+                    model
+                )
+
+            if class then
+                data.Class = class
+            end
+        end
+    end
+
+    for _, model in ipairs(remove) do
+        self:RemoveCandidate(model)
+    end
+
+    return added
+end
+
+function TargetAssist:FullUniversalScan()
+    self:RefreshKnownCandidates()
+
+    local descendants =
+        Workspace:GetDescendants()
+
+    local seen = {}
+    local added = 0
+
+    for index, object in ipairs(
+        descendants
+    ) do
+        if object:IsA("BasePart") then
+            local model, class =
+                self:
+                GetCandidateModelFromPart(
+                    object
+                )
+
+            if model
+                and not seen[model] then
+
+                seen[model] = true
+
+                if self:RegisterCandidate(
+                    model,
+                    class
+                ) then
+                    added += 1
+                end
+            end
+        end
+
+        if index % 1100 == 0 then
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    return added
+end
+
+function TargetAssist:GetCandidateClass(model)
+    local data =
+        self.Candidates[model]
+
+    if data then
+        return data.Class
+    end
+
+    local class =
+        self:
+        ClassifyUniversalModel(
+            model
+        )
+
+    if class then
+        self:RegisterCandidate(
+            model,
+            class
+        )
+    end
+
+    return class
+end
+
 function TargetAssist:IsClassAllowed(class)
     local mode = State.Targeting.TargetClass
 
     if mode == "Players" then
         return class == "PLAYER"
-
     elseif mode == "Monsters" then
         return class == "MONSTER"
-
     elseif mode == "NPCs" then
         return class == "NPC"
-
+    elseif mode == "Custom Models" then
+        return class == "CUSTOM"
     elseif mode == "Monsters + NPCs" then
         return class == "MONSTER"
             or class == "NPC"
-
-    elseif mode == "Everything" then
+    elseif mode == "Living / Animated"
+        or mode == "Universal" then
         return class == "PLAYER"
             or class == "MONSTER"
             or class == "NPC"
             or class == "ENTITY"
+            or class == "CUSTOM"
     end
 
     return false
@@ -6839,6 +7458,22 @@ function TargetAssist:GetPriorityScore(
     return screenDistance
 end
 
+function TargetAssist:GetClassPriorityBonus(class)
+    if class == "PLAYER" then
+        return -220
+    elseif class == "MONSTER" then
+        return -180
+    elseif class == "NPC" then
+        return -120
+    elseif class == "ENTITY" then
+        return -70
+    elseif class == "CUSTOM" then
+        return 120
+    end
+
+    return 0
+end
+
 function TargetAssist:FindTarget(center)
     Camera = Workspace.CurrentCamera
 
@@ -6846,18 +7481,25 @@ function TargetAssist:FindTarget(center)
         return nil
     end
 
+    self:ScanUniversal(false)
+
     local cameraPosition =
         Camera.CFrame.Position
 
     local best = nil
     local bestScore = math.huge
 
-    for model, data in pairs(EntityESP.Objects) do
+    for model, data in pairs(
+        self.Candidates
+    ) do
+        local class = data.Class
+
         if model.Parent
-            and data.Root
-            and data.Root.Parent
-            and self:IsClassAllowed(data.Class)
-            and self:PassesTeamCheck(model, data.Class)
+            and self:IsClassAllowed(class)
+            and self:PassesTeamCheck(
+                model,
+                class
+            )
             and self:IsAlive(model) then
 
             local aimPoint =
@@ -6865,11 +7507,26 @@ function TargetAssist:FindTarget(center)
 
             local aimPosition =
                 aimPoint
-                and self:GetAimPosition(aimPoint)
+                and self:
+                    GetAimPosition(
+                        aimPoint
+                    )
 
-            if aimPoint and aimPosition then
+            if aimPoint
+                and aimPosition then
+
+                aimPosition +=
+                    Vector3.new(
+                        State.Targeting.AimOffsetX,
+                        State.Targeting.AimOffsetY,
+                        State.Targeting.AimOffsetZ
+                    )
+
                 local worldDistance =
-                    (cameraPosition - aimPosition).Magnitude
+                    (
+                        cameraPosition
+                        - aimPosition
+                    ).Magnitude
 
                 if worldDistance
                     <= State.Targeting.MaxLockDistance then
@@ -6880,46 +7537,71 @@ function TargetAssist:FindTarget(center)
                             aimPosition
                         )
 
-                    if visible
-                        and screenPoint.Z > 0 then
+                    local screenDistance =
+                        (
+                            Vector2.new(
+                                screenPoint.X,
+                                screenPoint.Y
+                            )
+                            - center
+                        ).Magnitude
 
-                        local screenDistance =
-                            (
-                                Vector2.new(
-                                    screenPoint.X,
-                                    screenPoint.Y
-                                )
-                                - center
-                            ).Magnitude
+                    local screenPass =
+                        not State.Targeting.RequireOnScreenForAcquire
+                        or (
+                            visible
+                            and screenPoint.Z > 0
+                        )
 
-                        if screenDistance
+                    if screenPass
+                        and screenDistance
                             <= State.Targeting.FOV
-                            and self:
-                                HasLineOfSight(
-                                    model,
-                                    aimPoint
+                        and self:
+                            HasLineOfSight(
+                                model,
+                                aimPoint
+                            ) then
+
+                        local priority =
+                            self:
+                            GetPriorityScore(
+                                model,
+                                aimPoint,
+                                screenDistance,
+                                worldDistance
+                            )
+
+                        priority +=
+                            self:
+                            GetClassPriorityBonus(
+                                class
+                            )
+
+                        if State.Targeting.PreferLivingTargets then
+                            if model:
+                                FindFirstChildOfClass(
+                                    "Humanoid"
                                 ) then
-
-                            local priority =
-                                self:
-                                GetPriorityScore(
-                                    model,
-                                    aimPoint,
-                                    screenDistance,
-                                    worldDistance
-                                )
-
-                            if priority < bestScore then
-                                bestScore = priority
-
-                                best = {
-                                    Model = model,
-                                    Part = aimPoint,
-                                    Class = data.Class,
-                                    ScreenDistance = screenDistance,
-                                    WorldDistance = worldDistance,
-                                }
+                                priority -= 140
+                            elseif model:
+                                FindFirstChildOfClass(
+                                    "AnimationController"
+                                ) then
+                                priority -= 70
                             end
+                        end
+
+                        if priority < bestScore then
+                            bestScore = priority
+
+                            best = {
+                                Model = model,
+                                Part = aimPoint,
+                                Class = class,
+                                ScreenDistance = screenDistance,
+                                WorldDistance = worldDistance,
+                                Score = priority,
+                            }
                         end
                     end
                 end
@@ -6939,6 +7621,12 @@ function TargetAssist:SetLock(target)
     self.CurrentPart = target.Part
     self.CurrentClass = target.Class
     self.LastAcquire = os.clock()
+    self.Stats.Locks += 1
+
+    self:RegisterCandidate(
+        target.Model,
+        target.Class
+    )
 
     self:UpdateMobileDock()
 
@@ -6963,7 +7651,7 @@ function TargetAssist:ValidateCurrentLock()
 
     local class =
         self.CurrentClass
-        or classifyEntity(model)
+        or self:GetCandidateClass(model)
 
     if not class
         or not self:IsClassAllowed(class)
@@ -7003,11 +7691,12 @@ function TargetAssist:ValidateCurrentLock()
         return nil
     end
 
-    if not self:
-        HasLineOfSight(
-            model,
-            aimPoint
-        ) then
+    if not State.Targeting.StickyThroughWalls
+        and not self:
+            HasLineOfSight(
+                model,
+                aimPoint
+            ) then
         return nil
     end
 
@@ -7024,8 +7713,15 @@ function TargetAssist:AcquireLock()
         self:FindTarget(center)
 
     if not target then
-        -- Refresh once for late-spawned Humanoids / entities, then retry.
         EntityTracker:ScanNearby()
+        self:ScanUniversal(true)
+
+        target =
+            self:FindTarget(center)
+    end
+
+    if not target then
+        self:FullUniversalScan()
 
         target =
             self:FindTarget(center)
@@ -7114,25 +7810,29 @@ end
 
 function TargetAssist:FindEntityModelFromHit(hit)
     local current = hit
+    local fallback = nil
 
-    for _ = 1, 8 do
+    for _ = 1, 10 do
         if not current
             or current == Workspace then
             break
         end
 
         if current:IsA("Model") then
-            local data =
-                EntityESP.Objects[current]
+            fallback = fallback or current
 
             local class =
-                data
-                and data.Class
-                or classifyEntity(current)
+                self:
+                GetCandidateClass(
+                    current
+                )
 
             if class
                 and self:IsClassAllowed(class)
-                and self:PassesTeamCheck(current, class)
+                and self:PassesTeamCheck(
+                    current,
+                    class
+                )
                 and self:IsAlive(current) then
 
                 return current, class
@@ -7140,6 +7840,29 @@ function TargetAssist:FindEntityModelFromHit(hit)
         end
 
         current = current.Parent
+    end
+
+    if fallback
+        and fallback:IsA("Model") then
+
+        local metrics =
+            self:
+            GetModelMetrics(fallback)
+
+        if metrics
+            and metrics.Parts > 0
+            and metrics.MaxAxis
+                <= State.Targeting.CustomModelMaxSize then
+
+            self:RegisterCandidate(
+                fallback,
+                "CUSTOM"
+            )
+
+            if self:IsClassAllowed("CUSTOM") then
+                return fallback, "CUSTOM"
+            end
+        end
     end
 
     return nil
@@ -7247,6 +7970,10 @@ function TargetAssist:Update(dt)
     if not State.Targeting.Enabled
         or State.Freecam.Enabled then
 
+        if self.LockMarker then
+            self.LockMarker.Visible = false
+        end
+
         return
     end
 
@@ -7287,7 +8014,8 @@ function TargetAssist:Update(dt)
 
         local now = os.clock()
 
-        if now - self.LastAcquire >= 0.10 then
+        if now - self.LastAcquire
+            >= State.Targeting.ReacquireDelay then
             self.LastAcquire = now
 
             self:AcquireLock()
@@ -7306,6 +8034,15 @@ function TargetAssist:Update(dt)
         self:
         GetAimPosition(part)
 
+    if aimPosition then
+        aimPosition +=
+            Vector3.new(
+                State.Targeting.AimOffsetX,
+                State.Targeting.AimOffsetY,
+                State.Targeting.AimOffsetZ
+            )
+    end
+
     if not aimPosition then
         self:ClearLock("aim point unavailable")
         return
@@ -7317,6 +8054,41 @@ function TargetAssist:Update(dt)
     if (aimPosition - cameraPosition).Magnitude
         < 0.001 then
         return
+    end
+
+    if self.LockMarker then
+        local point, visible =
+            Camera:
+            WorldToViewportPoint(
+                aimPosition
+            )
+
+        self.LockMarker.Visible =
+            State.Targeting.ShowLockMarker
+            and visible
+            and point.Z > 0
+
+        if self.LockMarker.Visible then
+            self.LockMarker.Position =
+                UDim2.fromOffset(
+                    point.X,
+                    point.Y
+                )
+
+            if self.LockMarkerLabel then
+                self.LockMarkerLabel.Text =
+                    tostring(
+                        self.CurrentModel
+                        and self.CurrentModel.Name
+                        or "LOCK"
+                    )
+                    .. " | "
+                    .. tostring(
+                        part.Label
+                        or State.Targeting.TargetPart
+                    )
+            end
+        end
     end
 
     local desired =
@@ -7352,7 +8124,7 @@ end
 
 RunService:BindToRenderStep(
     TARGET_RENDER_BIND,
-    Enum.RenderPriority.Camera.Value + 50,
+    Enum.RenderPriority.Last.Value - 1,
     function(dt)
         TargetAssist:Update(dt)
     end
@@ -7376,6 +8148,28 @@ connect(UIS.TouchTap, function(touchPositions, processedByUI)
 end)
 
 TargetAssist:EnsureMobileDock()
+
+
+-- Universal target discovery loop.
+task.spawn(function()
+    while State.Running do
+        task.wait(
+            math.max(
+                State.Targeting.ScanInterval,
+                0.20
+            )
+        )
+
+        if State.Running
+            and State.Targeting.Enabled
+            and State.Targeting.UniversalScan then
+            pcall(function()
+                TargetAssist:
+                    ScanUniversal(false)
+            end)
+        end
+    end
+end)
 
 --========================================================
 -- RUNTIME CONSOLE
@@ -8049,13 +8843,15 @@ AimBox:AddDropdown(
     {
         Text = "Target class",
         Values = {
+            "Universal",
             "Players",
             "Monsters",
             "NPCs",
+            "Custom Models",
             "Monsters + NPCs",
-            "Everything",
+            "Living / Animated",
         },
-        Default = "Monsters",
+        Default = "Universal",
         Multi = false,
 
         Callback = function(value)
@@ -8076,6 +8872,71 @@ AimBox:AddToggle(
         Callback = function(value)
             State.Targeting.TeamCheck = value
             TargetAssist:ClearLock("team check changed")
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetUniversalScan",
+    {
+        Text = "Universal target discovery",
+        Default = true,
+        Tooltip = "Aim owns a separate spatial registry and no longer depends on ESP or Humanoid spawn timing.",
+
+        Callback = function(value)
+            State.Targeting.UniversalScan = value
+
+            if value then
+                task.spawn(function()
+                    TargetAssist:
+                        ScanUniversal(true)
+                end)
+            end
+        end,
+    }
+)
+
+AimBox:AddSlider(
+    "TargetScanRadius",
+    {
+        Text = "Universal scan radius",
+        Default = 3000,
+        Min = 300,
+        Max = 8000,
+        Rounding = 0,
+        Suffix = " studs",
+
+        Callback = function(value)
+            State.Targeting.ScanRadius = value
+        end,
+    }
+)
+
+AimBox:AddSlider(
+    "TargetScanInterval",
+    {
+        Text = "Discovery interval",
+        Default = 0.45,
+        Min = 0.20,
+        Max = 2.00,
+        Rounding = 2,
+        Suffix = "s",
+
+        Callback = function(value)
+            State.Targeting.ScanInterval = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetStickyThroughWalls",
+    {
+        Text = "Keep sticky lock through walls",
+        Default = true,
+        Tooltip = "Wall check applies while acquiring; an existing sticky lock is not dropped solely by cover.",
+
+        Callback = function(value)
+            State.Targeting.StickyThroughWalls = value
         end,
     }
 )
@@ -8311,6 +9172,111 @@ AimBox:AddSlider(
     }
 )
 
+AimBox:AddSlider(
+    "TargetAimOffsetY",
+    {
+        Text = "Vertical aim offset",
+        Default = 0,
+        Min = -8,
+        Max = 8,
+        Rounding = 1,
+        Suffix = " studs",
+
+        Callback = function(value)
+            State.Targeting.AimOffsetY = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetShowLockMarker",
+    {
+        Text = "Show lock marker",
+        Default = true,
+
+        Callback = function(value)
+            State.Targeting.ShowLockMarker = value
+
+            if not value
+                and TargetAssist.LockMarker then
+                TargetAssist.LockMarker.Visible = false
+            end
+        end,
+    }
+)
+
+AimBox:AddButton({
+    Text = "Force universal rescan",
+
+    Func = function()
+        task.spawn(function()
+            local n =
+                card(
+                    "SCAN",
+                    "Universal Aim Scan",
+                    "Scanning Workspace candidates...",
+                    10
+                )
+
+            local added =
+                TargetAssist:
+                FullUniversalScan()
+
+            if n and n.ChangeDescription then
+                n:ChangeDescription(
+                    tostring(added)
+                    .. " new targets. "
+                    .. tostring(TargetAssist.CandidateCount)
+                    .. " total candidates."
+                )
+            end
+        end)
+    end,
+})
+
+AimBox:AddButton({
+    Text = "Aim diagnostics",
+
+    Func = function()
+        local lines = {
+            "Candidates: " .. tostring(TargetAssist.CandidateCount),
+            "Scans: " .. tostring(TargetAssist.Stats.Scans),
+            "Locks: " .. tostring(TargetAssist.Stats.Locks),
+        }
+
+        if TargetAssist.CurrentModel
+            and TargetAssist.CurrentModel.Parent then
+            table.insert(
+                lines,
+                "Current: "
+                .. TargetAssist.CurrentModel.Name
+            )
+
+            table.insert(
+                lines,
+                "Class: "
+                .. tostring(TargetAssist.CurrentClass)
+            )
+
+            table.insert(
+                lines,
+                "Point: "
+                .. TargetAssist:
+                    DescribeAimPoint(
+                        TargetAssist.CurrentPart
+                    )
+            )
+        end
+
+        card(
+            "SCAN",
+            "Aim Diagnostics",
+            table.concat(lines, "\\n"),
+            9
+        )
+    end,
+})
+
 AimBox:AddToggle(
     "TargetAssistHoldMouse",
     {
@@ -8431,8 +9397,8 @@ MobileAimBox:AddToggle(
     "MobileTapToLock",
     {
         Text = "Tap target to lock",
-        Default = false,
-        Tooltip = "When Aim Lock is enabled, tapping a valid entity can select it directly.",
+        Default = true,
+        Tooltip = "When Aim Lock is enabled, tapping a valid entity or custom model selects it directly.",
 
         Callback = function(value)
             State.Targeting.TapToLock = value
@@ -10526,6 +11492,48 @@ DevBox:AddButton({
 })
 
 DevBox:AddButton({
+    Text = "Universal aim report",
+
+    Func = function()
+        task.spawn(function()
+            TargetAssist:
+                ScanUniversal(true)
+
+            local counts = {
+                PLAYER = 0,
+                MONSTER = 0,
+                NPC = 0,
+                ENTITY = 0,
+                CUSTOM = 0,
+            }
+
+            for _, data in pairs(
+                TargetAssist.Candidates
+            ) do
+                if counts[data.Class] ~= nil then
+                    counts[data.Class] += 1
+                end
+            end
+
+            card(
+                "SCAN",
+                "Universal Aim Registry",
+                string.format(
+                    "Total %d\\nPlayers %d\\nMonsters %d\\nNPCs %d\\nEntities %d\\nCustom %d",
+                    TargetAssist.CandidateCount,
+                    counts.PLAYER,
+                    counts.MONSTER,
+                    counts.NPC,
+                    counts.ENTITY,
+                    counts.CUSTOM
+                ),
+                9
+            )
+        end)
+    end,
+})
+
+DevBox:AddButton({
     Text = "Character attributes",
 
     Func = function()
@@ -10713,6 +11721,15 @@ ChangelogLeft:AddLabel({
 })
 
 local NewChanges = {
+    "Independent Universal Aim Registry separated from ESP and Humanoid timing",
+    "Spatial discovery plus late-spawn target recovery",
+    "Universal mode for Players, Monsters, NPCs, Entities and custom Blender models",
+    "Sticky hard lock can remain attached after cover",
+    "Late render-priority camera ownership for stronger lock",
+    "Visible lock marker with resolved target point",
+    "Direct mobile tap-to-lock for custom models",
+    "Force universal rescan and Aim Diagnostics",
+    "Main window position lock prevents accidental tab/sidebar dragging",
     "Smart Target Point for normal rigs and Blender/custom models",
     "Direct support for Bone.WorldPosition and Attachment.WorldPosition",
     "BoundingBox Model Top and Model Center aim points",
@@ -10857,6 +11874,19 @@ InterfaceBox:AddToggle(
 
         Callback = function(value)
             Window:SetCompact(value)
+        end,
+    }
+)
+
+InterfaceBox:AddToggle(
+    "LockMainWindowDragging",
+    {
+        Text = "Lock main window position",
+        Default = true,
+        Tooltip = "Prevents accidental movement when holding/dragging tabs or sidebar controls.",
+
+        Callback = function(value)
+            Library.CantDragForced = value
         end,
     }
 )
@@ -11133,6 +12163,9 @@ local function cleanup()
     PerformanceHUD:SetVisible(false)
     ThreatHUD:SetVisible(false)
 
+    table.clear(TargetAssist.Candidates)
+    TargetAssist.CandidateCount = 0
+
     disconnectAll()
 
     _G.__NUVEM_HUB = nil
@@ -11161,6 +12194,11 @@ MaintenanceBox:AddButton({
 task.spawn(function()
     Interactables:ScanLocal()
     EntityTracker:ScanNearby()
+
+    task.spawn(function()
+        TargetAssist:
+            ScanUniversal(true)
+    end)
 
     playStartupChime()
 
@@ -11200,6 +12238,25 @@ _G.__NUVEM_HUB = {
     ReactionLab = ReactionLab,
     ServerTools = ServerTools,
     Music = Music,
+    TargetAssist = TargetAssist,
+    AimCandidates = TargetAssist.Candidates,
+
+    AimLock = function()
+        State.Targeting.Enabled = true
+        return TargetAssist:AcquireLock()
+    end,
+
+    AimUnlock = function()
+        return TargetAssist:ClearLock("api")
+    end,
+
+    AimScan = function(full)
+        if full then
+            return TargetAssist:FullUniversalScan()
+        end
+
+        return TargetAssist:ScanUniversal(true)
+    end,
 
     PlayStartupChime = playStartupChime,
 
@@ -11214,4 +12271,73 @@ _G.__NUVEM_HUB = {
     end,
 }
 
-print("[Nuvem Hub] major update loaded.")
+
+--========================================================
+-- AIM DEVELOPER API
+--========================================================
+
+_G.__NUVEM_HUB.Aim = {
+    Enable = function()
+        State.Targeting.Enabled = true
+        TargetAssist:ScanUniversal(true)
+        return TargetAssist:AcquireLock()
+    end,
+
+    Disable = function()
+        State.Targeting.Enabled = false
+        TargetAssist:ClearLock("api-disable")
+    end,
+
+    Lock = function()
+        State.Targeting.Enabled = true
+        return TargetAssist:AcquireLock()
+    end,
+
+    Unlock = function()
+        TargetAssist:ClearLock("api-unlock")
+    end,
+
+    Scan = function()
+        return TargetAssist:ScanUniversal(true)
+    end,
+
+    FullScan = function()
+        return TargetAssist:FullUniversalScan()
+    end,
+
+    GetCurrent = function()
+        return {
+            Model = TargetAssist.CurrentModel,
+            Class = TargetAssist.CurrentClass,
+            AimPoint = TargetAssist.CurrentPart,
+            Description =
+                TargetAssist:
+                DescribeAimPoint(
+                    TargetAssist.CurrentPart
+                ),
+        }
+    end,
+
+    GetCandidateCount = function()
+        return TargetAssist.CandidateCount
+    end,
+
+    SetTargetMode = function(mode)
+        State.Targeting.TargetClass = tostring(mode)
+        TargetAssist:ClearLock("api-mode")
+    end,
+
+    SetTargetPoint = function(point)
+        State.Targeting.TargetPart = tostring(point)
+        TargetAssist.CurrentPart = nil
+    end,
+
+    SetHardLock = function(enabled)
+        State.Targeting.LockMode =
+            enabled
+            and "Hard"
+            or "Soft"
+    end,
+}
+
+print("cute frieren.")
