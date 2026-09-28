@@ -123,7 +123,7 @@ local Window = Library:CreateWindow({
     -- a Frieren-inspired fantasy feel without depending on an external image asset.
     Icon = "sparkles",
 
-    Size = UDim2.fromOffset(640, 470),
+    Size = UIS.TouchEnabled and UDim2.fromOffset(570, 430) or UDim2.fromOffset(640, 470),
     Center = true,
     AutoShow = true,
     Resizable = true,
@@ -256,13 +256,37 @@ local State = {
     Targeting = {
         Enabled = false,
         TargetClass = "Monsters",
-        TargetPart = "Head",
+        TargetPart = "Auto",
+        ModelTopOffset = 0.32,
+
+        -- Acquisition
         FOV = 165,
-        Smoothness = 0.22,
+        TargetPriority = "Crosshair",
+        MaxLockDistance = 2500,
         WallCheck = true,
         TeamCheck = true,
-        HoldRightMouse = true,
+        StrictPart = true,
+
+        -- Real lock behaviour
+        LockMode = "Hard",
+        Smoothness = 0.22,
+        StickyLock = true,
+        AutoLock = true,
+        AutoReacquire = true,
+
+        -- Optional motion compensation. Disabled by default so "Hard" aims
+        -- exactly at the selected BasePart position.
+        Prediction = false,
+        PredictionTime = 0.08,
+
+        -- Desktop can still use RMB if desired. Mobile never requires it.
+        HoldRightMouse = not UIS.TouchEnabled,
         ShowFOV = true,
+
+        -- Touch controls
+        MobileControls = true,
+        MobileDockScale = 1.0,
+        TapToLock = false,
     },
 
     Freecam = {
@@ -1003,11 +1027,17 @@ local function classifyEntity(model)
         { "Hostile", "Enemy", "IsMonster" }
     )
 
-    if humanoid and (
+    -- Blender/custom rigs do not always use Humanoid.
+    -- Explicit Monster/Enemy tags or attributes are enough if the model
+    -- contains a renderable BasePart/MeshPart.
+    if (
         monsterTag
         or monsterAttribute
-        or containsAny(ancestryBlob, HostileWords)
-    ) then
+        or (
+            humanoid
+            and containsAny(ancestryBlob, HostileWords)
+        )
+    ) and getEntityRoot(model) then
         return "MONSTER"
     end
 
@@ -1021,7 +1051,8 @@ local function classifyEntity(model)
         { "NPC", "IsNPC" }
     )
 
-    if humanoid and (npcTag or npcAttribute) then
+    if (npcTag or npcAttribute)
+        and getEntityRoot(model) then
         return "NPC"
     end
 
@@ -5782,13 +5813,32 @@ connect(RunService.Heartbeat, function()
 end)
 
 --========================================================
--- CAMERA TARGET ASSIST
+-- CAMERA TARGET ASSIST - AIM MAJOR UPDATE
 --========================================================
 
 local TargetAssist = {
     Gui = nil,
     Circle = nil,
+
+    CurrentModel = nil,
+    CurrentPart = nil,
+    CurrentClass = nil,
+
+    LastAcquire = 0,
+
+    MobileGui = nil,
+    MobileDock = nil,
+    MobileScale = nil,
+    MobileStatus = nil,
+    MobileButtons = {},
+    MobileConnections = {},
 }
+
+local TARGET_RENDER_BIND = "NuvemTargetAssistLock"
+
+pcall(function()
+    RunService:UnbindFromRenderStep(TARGET_RENDER_BIND)
+end)
 
 function TargetAssist:EnsureGui()
     if self.Gui and self.Gui.Parent then
@@ -5815,21 +5865,352 @@ function TargetAssist:EnsureGui()
 
     local stroke = Instance.new("UIStroke")
     stroke.Color = Library.Scheme.AccentColor
-    stroke.Transparency = 0.25
-    stroke.Thickness = 1
+    stroke.Transparency = 0.18
+    stroke.Thickness = 1.4
     stroke.Parent = circle
 
     self.Gui = gui
     self.Circle = circle
 end
 
+function TargetAssist:MobileConnect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(self.MobileConnections, connection)
+    return connection
+end
+
+function TargetAssist:DestroyMobileDock()
+    for _, connection in ipairs(self.MobileConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+
+    table.clear(self.MobileConnections)
+
+    if self.MobileGui then
+        pcall(function()
+            self.MobileGui:Destroy()
+        end)
+    end
+
+    self.MobileGui = nil
+    self.MobileDock = nil
+    self.MobileScale = nil
+    self.MobileStatus = nil
+    self.MobileButtons = {}
+end
+
+function TargetAssist:MakeMobileButton(parent, name, textValue, order)
+    local button = Instance.new("TextButton")
+    button.Name = name
+    button.LayoutOrder = order
+    button.Size = UDim2.fromOffset(66, 42)
+    button.BackgroundColor3 = Color3.fromRGB(28, 30, 44)
+    button.BackgroundTransparency = 0.05
+    button.BorderSizePixel = 0
+    button.Text = textValue
+    button.TextColor3 = Color3.fromRGB(240, 242, 255)
+    button.TextSize = 12
+    button.Font = Enum.Font.GothamBold
+    button.AutoButtonColor = true
+    button.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 9)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(78, 82, 110)
+    stroke.Transparency = 0.28
+    stroke.Thickness = 1
+    stroke.Parent = button
+
+    return button
+end
+
+function TargetAssist:EnsureMobileDock()
+    if not UIS.TouchEnabled or not State.Targeting.MobileControls then
+        if self.MobileGui then
+            self:DestroyMobileDock()
+        end
+        return
+    end
+
+    if self.MobileGui and self.MobileGui.Parent then
+        if self.MobileScale then
+            self.MobileScale.Scale = State.Targeting.MobileDockScale
+        end
+        return
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "NuvemAimMobile"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = false
+    gui.DisplayOrder = 999975
+    gui.Parent = getUiParent()
+
+    local dock = Instance.new("Frame")
+    dock.Name = "AimDock"
+    dock.AnchorPoint = Vector2.new(0.5, 1)
+    dock.Position = UDim2.new(0.5, 0, 1, -126)
+    dock.Size = UDim2.fromOffset(302, 92)
+    dock.BackgroundColor3 = Color3.fromRGB(14, 16, 25)
+    dock.BackgroundTransparency = 0.06
+    dock.BorderSizePixel = 0
+    dock.Active = true
+    dock.Parent = gui
+
+    local dockCorner = Instance.new("UICorner")
+    dockCorner.CornerRadius = UDim.new(0, 13)
+    dockCorner.Parent = dock
+
+    local dockStroke = Instance.new("UIStroke")
+    dockStroke.Color = Library.Scheme.AccentColor
+    dockStroke.Transparency = 0.22
+    dockStroke.Thickness = 1.2
+    dockStroke.Parent = dock
+
+    local scale = Instance.new("UIScale")
+    scale.Scale = State.Targeting.MobileDockScale
+    scale.Parent = dock
+
+    local header = Instance.new("TextLabel")
+    header.Name = "Status"
+    header.Size = UDim2.new(1, -16, 0, 28)
+    header.Position = UDim2.fromOffset(8, 4)
+    header.BackgroundTransparency = 1
+    header.Text = "NUVEM AIM | NO TARGET"
+    header.TextColor3 = Color3.fromRGB(220, 224, 245)
+    header.TextSize = 11
+    header.Font = Enum.Font.GothamBold
+    header.TextXAlignment = Enum.TextXAlignment.Left
+    header.TextTruncate = Enum.TextTruncate.AtEnd
+    header.Active = true
+    header.Parent = dock
+
+    local buttons = Instance.new("Frame")
+    buttons.Name = "Buttons"
+    buttons.Size = UDim2.new(1, -12, 0, 46)
+    buttons.Position = UDim2.fromOffset(6, 37)
+    buttons.BackgroundTransparency = 1
+    buttons.Parent = dock
+
+    local list = Instance.new("UIListLayout")
+    list.FillDirection = Enum.FillDirection.Horizontal
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    list.VerticalAlignment = Enum.VerticalAlignment.Center
+    list.Padding = UDim.new(0, 6)
+    list.Parent = buttons
+
+    local aimButton = self:MakeMobileButton(buttons, "Aim", "AIM OFF", 1)
+    local lockButton = self:MakeMobileButton(buttons, "Lock", "LOCK", 2)
+    local partButton = self:MakeMobileButton(buttons, "Part", "HEAD", 3)
+    local modeButton = self:MakeMobileButton(buttons, "Mode", "HARD", 4)
+
+    self.MobileGui = gui
+    self.MobileDock = dock
+    self.MobileScale = scale
+    self.MobileStatus = header
+
+    self.MobileButtons = {
+        Aim = aimButton,
+        Lock = lockButton,
+        Part = partButton,
+        Mode = modeButton,
+    }
+
+    self:MobileConnect(aimButton.Activated, function()
+        local newValue = not State.Targeting.Enabled
+
+        if Toggles.TargetAssistEnabled
+            and Toggles.TargetAssistEnabled.SetValue then
+            Toggles.TargetAssistEnabled:SetValue(newValue)
+        else
+            State.Targeting.Enabled = newValue
+
+            if not newValue then
+                self:ClearLock("disabled")
+            end
+        end
+
+        self:UpdateMobileDock()
+    end)
+
+    self:MobileConnect(lockButton.Activated, function()
+        self:ToggleManualLock()
+        self:UpdateMobileDock()
+    end)
+
+    self:MobileConnect(partButton.Activated, function()
+        self:CyclePart()
+        self:UpdateMobileDock()
+    end)
+
+    self:MobileConnect(modeButton.Activated, function()
+        self:ToggleLockMode()
+        self:UpdateMobileDock()
+    end)
+
+    -- Touch drag: drag the status/header instead of needing a keyboard shortcut.
+    local dragging = false
+    local dragStart = nil
+    local startPosition = nil
+    local dragInput = nil
+
+    self:MobileConnect(header.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+
+            dragging = true
+            dragStart = input.Position
+            startPosition = dock.Position
+
+            local ended
+            ended = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if ended then
+                        ended:Disconnect()
+                    end
+                end
+            end)
+
+            table.insert(self.MobileConnections, ended)
+        end
+    end)
+
+    self:MobileConnect(header.InputChanged, function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+    end)
+
+    self:MobileConnect(UIS.InputChanged, function(input)
+        if not dragging
+            or input ~= dragInput
+            or not dragStart
+            or not startPosition then
+            return
+        end
+
+        local delta = input.Position - dragStart
+
+        dock.Position = UDim2.new(
+            startPosition.X.Scale,
+            startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale,
+            startPosition.Y.Offset + delta.Y
+        )
+    end)
+
+    self:UpdateMobileDock()
+end
+
+function TargetAssist:UpdateMobileDock()
+    if not self.MobileGui
+        or not self.MobileGui.Parent then
+        return
+    end
+
+    if self.MobileScale then
+        self.MobileScale.Scale = State.Targeting.MobileDockScale
+    end
+
+    local accent = Library.Scheme.AccentColor
+    local inactive = Color3.fromRGB(28, 30, 44)
+
+    if self.MobileButtons.Aim then
+        self.MobileButtons.Aim.Text =
+            State.Targeting.Enabled
+            and "AIM ON"
+            or "AIM OFF"
+
+        self.MobileButtons.Aim.BackgroundColor3 =
+            State.Targeting.Enabled
+            and accent
+            or inactive
+    end
+
+    if self.MobileButtons.Lock then
+        self.MobileButtons.Lock.Text =
+            self.CurrentModel
+            and "UNLOCK"
+            or "LOCK"
+
+        self.MobileButtons.Lock.BackgroundColor3 =
+            self.CurrentModel
+            and Color3.fromRGB(154, 92, 255)
+            or inactive
+    end
+
+    if self.MobileButtons.Part then
+        local short = {
+            Auto = "AUTO",
+            Head = "HEAD",
+            HumanoidRootPart = "ROOT",
+            UpperTorso = "UPPER",
+            LowerTorso = "LOWER",
+            ["Bone Head"] = "BONE",
+            ["Attachment Head"] = "ATTACH",
+            ["Model Top"] = "TOP",
+            ["Model Center"] = "CENTER",
+            PrimaryPart = "PRIMARY",
+            ["Nearest Part"] = "NEAR",
+        }
+
+        self.MobileButtons.Part.Text =
+            short[State.Targeting.TargetPart]
+            or "POINT"
+    end
+
+    if self.MobileButtons.Mode then
+        self.MobileButtons.Mode.Text =
+            string.upper(State.Targeting.LockMode)
+    end
+
+    if self.MobileStatus then
+        if self.CurrentModel
+            and self.CurrentModel.Parent then
+
+            local resolvedLabel =
+                self.CurrentPart
+                and self.CurrentPart.Label
+                or State.Targeting.TargetPart
+
+            self.MobileStatus.Text =
+                "NUVEM AIM | "
+                .. self.CurrentModel.Name
+                .. " | "
+                .. tostring(resolvedLabel)
+        else
+            self.MobileStatus.Text =
+                "NUVEM AIM | NO TARGET"
+        end
+    end
+end
+
 function TargetAssist:Destroy()
+    pcall(function()
+        RunService:UnbindFromRenderStep(TARGET_RENDER_BIND)
+    end)
+
+    self:DestroyMobileDock()
+
     if self.Gui then
-        self.Gui:Destroy()
+        pcall(function()
+            self.Gui:Destroy()
+        end)
     end
 
     self.Gui = nil
     self.Circle = nil
+
+    self.CurrentModel = nil
+    self.CurrentPart = nil
+    self.CurrentClass = nil
 end
 
 function TargetAssist:IsClassAllowed(class)
@@ -5837,12 +6218,17 @@ function TargetAssist:IsClassAllowed(class)
 
     if mode == "Players" then
         return class == "PLAYER"
+
     elseif mode == "Monsters" then
         return class == "MONSTER"
+
     elseif mode == "NPCs" then
         return class == "NPC"
+
     elseif mode == "Monsters + NPCs" then
-        return class == "MONSTER" or class == "NPC"
+        return class == "MONSTER"
+            or class == "NPC"
+
     elseif mode == "Everything" then
         return class == "PLAYER"
             or class == "MONSTER"
@@ -5867,7 +6253,6 @@ function TargetAssist:PassesTeamCheck(model, class)
         return false
     end
 
-    -- Neutral players are treated as free-for-all targets.
     if LocalPlayer.Neutral
         or targetPlayer.Neutral then
         return true
@@ -5881,19 +6266,463 @@ function TargetAssist:PassesTeamCheck(model, class)
     return targetPlayer.TeamColor ~= LocalPlayer.TeamColor
 end
 
-function TargetAssist:GetAimPart(model)
-    if State.Targeting.TargetPart == "Head" then
-        return model:FindFirstChild("Head") or getEntityRoot(model)
-    elseif State.Targeting.TargetPart == "UpperTorso" then
-        return model:FindFirstChild("UpperTorso")
-            or model:FindFirstChild("Torso")
-            or getEntityRoot(model)
+function TargetAssist:IsAlive(model)
+    local humanoid =
+        model
+        and model:FindFirstChildOfClass("Humanoid")
+
+    if humanoid then
+        return humanoid.Health > 0
     end
 
-    return getEntityRoot(model)
+    return model ~= nil
+        and model.Parent ~= nil
 end
 
-function TargetAssist:HasLineOfSight(targetModel, targetPart)
+function TargetAssist:FindNamedBasePart(model, names)
+    for _, wanted in ipairs(names) do
+        local exact = model:FindFirstChild(wanted, true)
+
+        if exact and exact:IsA("BasePart") then
+            return exact
+        end
+    end
+
+    local wantedLower = {}
+
+    for _, wanted in ipairs(names) do
+        wantedLower[string.lower(wanted)] = true
+    end
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("BasePart")
+            and wantedLower[string.lower(object.Name)] then
+            return object
+        end
+    end
+
+    return nil
+end
+
+function TargetAssist:FindHeadBone(model)
+    local exactNames = {
+        head = true,
+        skull = true,
+        cranium = true,
+        headbone = true,
+        head_bone = true,
+    }
+
+    local fuzzy = nil
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("Bone") then
+            local name = string.lower(object.Name)
+
+            if exactNames[name] then
+                return object
+            end
+
+            if not fuzzy
+                and (
+                    string.find(name, "head", 1, true)
+                    or string.find(name, "skull", 1, true)
+                    or string.find(name, "cranium", 1, true)
+                ) then
+                fuzzy = object
+            end
+        end
+    end
+
+    return fuzzy
+end
+
+function TargetAssist:FindHeadAttachment(model)
+    local preferred = {
+        headattachment = true,
+        facecenterattachment = true,
+        facefrontattachment = true,
+        hairattachment = true,
+        hatattachment = true,
+    }
+
+    local fuzzy = nil
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("Attachment") then
+            local name = string.lower(object.Name)
+
+            if preferred[name] then
+                return object
+            end
+
+            if not fuzzy
+                and (
+                    string.find(name, "head", 1, true)
+                    or string.find(name, "face", 1, true)
+                ) then
+                fuzzy = object
+            end
+        end
+    end
+
+    return fuzzy
+end
+
+function TargetAssist:GetNearestBasePart(model)
+    Camera = Workspace.CurrentCamera
+
+    local best = nil
+    local bestDistance = math.huge
+
+    local origin =
+        Camera
+        and Camera.CFrame.Position
+        or Vector3.zero
+
+    for _, object in ipairs(model:GetDescendants()) do
+        if object:IsA("BasePart") then
+            local distance =
+                (object.Position - origin).Magnitude
+
+            if distance < bestDistance then
+                bestDistance = distance
+                best = object
+            end
+        end
+    end
+
+    return best
+end
+
+function TargetAssist:MakeObjectAimPoint(kind, object, label)
+    if not object then
+        return nil
+    end
+
+    return {
+        Kind = kind,
+        Object = object,
+        Label = label or object.Name,
+    }
+end
+
+function TargetAssist:MakeModelAimPoint(model, mode, label)
+    if not model then
+        return nil
+    end
+
+    return {
+        Kind = "ModelPoint",
+        Model = model,
+        Mode = mode,
+        Label = label or mode,
+    }
+end
+
+function TargetAssist:IsAimPointValid(point)
+    if not point then
+        return false
+    end
+
+    if point.Kind == "ModelPoint" then
+        return point.Model ~= nil
+            and point.Model.Parent ~= nil
+    end
+
+    local object = point.Object
+
+    return object ~= nil
+        and object.Parent ~= nil
+end
+
+function TargetAssist:GetObjectVelocity(object)
+    if not object then
+        return Vector3.zero
+    end
+
+    if object:IsA("BasePart") then
+        return object.AssemblyLinearVelocity
+    end
+
+    local current = object.Parent
+
+    while current do
+        if current:IsA("BasePart") then
+            return current.AssemblyLinearVelocity
+        end
+
+        current = current.Parent
+    end
+
+    return Vector3.zero
+end
+
+function TargetAssist:GetAimPosition(point)
+    if not self:IsAimPointValid(point) then
+        return nil
+    end
+
+    local position = nil
+
+    if point.Kind == "BasePart" then
+        position = point.Object.Position
+
+    elseif point.Kind == "Attachment" then
+        position = point.Object.WorldPosition
+
+    elseif point.Kind == "Bone" then
+        position = point.Object.WorldPosition
+
+    elseif point.Kind == "ModelPoint" then
+        local model = point.Model
+        local cf, size = model:GetBoundingBox()
+
+        if point.Mode == "Top" then
+            position =
+                cf.Position
+                + cf.UpVector
+                * (
+                    size.Y
+                    * State.Targeting.ModelTopOffset
+                )
+        else
+            position = cf.Position
+        end
+    end
+
+    if not position then
+        return nil
+    end
+
+    if State.Targeting.Prediction
+        and point.Kind ~= "ModelPoint" then
+
+        position +=
+            self:GetObjectVelocity(point.Object)
+            * State.Targeting.PredictionTime
+    end
+
+    return position
+end
+
+function TargetAssist:GetAimPart(model)
+    if not model then
+        return nil
+    end
+
+    local selected = State.Targeting.TargetPart
+
+    local function base(names, label)
+        local object =
+            self:
+            FindNamedBasePart(
+                model,
+                names
+            )
+
+        return self:
+            MakeObjectAimPoint(
+                "BasePart",
+                object,
+                label
+            )
+    end
+
+    local function boneHead()
+        return self:
+            MakeObjectAimPoint(
+                "Bone",
+                self:FindHeadBone(model),
+                "Bone Head"
+            )
+    end
+
+    local function attachmentHead()
+        return self:
+            MakeObjectAimPoint(
+                "Attachment",
+                self:FindHeadAttachment(model),
+                "Attachment Head"
+            )
+    end
+
+    if selected == "Head" then
+        local point =
+            base(
+                { "Head" },
+                "Head"
+            )
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "HumanoidRootPart" then
+        local point =
+            base(
+                { "HumanoidRootPart" },
+                "HumanoidRootPart"
+            )
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "UpperTorso" then
+        local point =
+            base(
+                {
+                    "UpperTorso",
+                    "Torso",
+                },
+                "UpperTorso"
+            )
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "LowerTorso" then
+        local point =
+            base(
+                {
+                    "LowerTorso",
+                    "Torso",
+                },
+                "LowerTorso"
+            )
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "Bone Head" then
+        local point = boneHead()
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "Attachment Head" then
+        local point = attachmentHead()
+
+        if point
+            or State.Targeting.StrictPart then
+            return point
+        end
+
+    elseif selected == "Model Top" then
+        return self:
+            MakeModelAimPoint(
+                model,
+                "Top",
+                "Model Top"
+            )
+
+    elseif selected == "Model Center" then
+        return self:
+            MakeModelAimPoint(
+                model,
+                "Center",
+                "Model Center"
+            )
+
+    elseif selected == "PrimaryPart" then
+        if model.PrimaryPart then
+            return self:
+                MakeObjectAimPoint(
+                    "BasePart",
+                    model.PrimaryPart,
+                    "PrimaryPart"
+                )
+        end
+
+        if State.Targeting.StrictPart then
+            return nil
+        end
+
+    elseif selected == "Nearest Part" then
+        return self:
+            MakeObjectAimPoint(
+                "BasePart",
+                self:GetNearestBasePart(model),
+                "Nearest Part"
+            )
+    end
+
+    -- AUTO SMART TARGET POINT
+    -- 1) Real Roblox/custom BasePart head
+    local point =
+        base(
+            { "Head" },
+            "Head"
+        )
+
+    if point then
+        return point
+    end
+
+    -- 2) Blender/skinned-mesh bone head
+    point = boneHead()
+
+    if point then
+        return point
+    end
+
+    -- 3) Head/face attachment
+    point = attachmentHead()
+
+    if point then
+        return point
+    end
+
+    -- 4) Conventional root for Humanoid rigs
+    point =
+        base(
+            { "HumanoidRootPart" },
+            "HumanoidRootPart"
+        )
+
+    if point then
+        return point
+    end
+
+    -- 5) PrimaryPart when the creator configured one
+    if model.PrimaryPart then
+        return self:
+            MakeObjectAimPoint(
+                "BasePart",
+                model.PrimaryPart,
+                "PrimaryPart"
+            )
+    end
+
+    -- 6) Custom one-piece / Blender model: estimate an upper-body point
+    if model:FindFirstChildWhichIsA("BasePart", true) then
+        return self:
+            MakeModelAimPoint(
+                model,
+                "Top",
+                "Auto Model Top"
+            )
+    end
+
+    -- 7) Last BasePart fallback
+    return self:
+        MakeObjectAimPoint(
+            "BasePart",
+            self:GetNearestBasePart(model),
+            "Nearest Part"
+        )
+end
+
+function TargetAssist:HasLineOfSight(targetModel, aimPoint)
     if not State.Targeting.WallCheck then
         return true
     end
@@ -5904,6 +6733,16 @@ function TargetAssist:HasLineOfSight(targetModel, targetPart)
         return false
     end
 
+    local position =
+        self:
+        GetAimPosition(
+            aimPoint
+        )
+
+    if not position then
+        return false
+    end
+
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = {
@@ -5911,14 +6750,93 @@ function TargetAssist:HasLineOfSight(targetModel, targetPart)
         targetModel,
     }
 
-    local direction = targetPart.Position - Camera.CFrame.Position
-    local result = Workspace:Raycast(
-        Camera.CFrame.Position,
-        direction,
-        params
-    )
+    local direction =
+        position
+        - Camera.CFrame.Position
+
+    local result =
+        Workspace:Raycast(
+            Camera.CFrame.Position,
+            direction,
+            params
+        )
 
     return result == nil
+end
+
+function TargetAssist:DescribeAimPoint(point)
+    if not point then
+        return "None"
+    end
+
+    if point.Kind == "ModelPoint" then
+        return point.Label
+            .. " [BoundingBox]"
+    end
+
+    local object = point.Object
+
+    return tostring(point.Label)
+        .. " ["
+        .. tostring(point.Kind)
+        .. "]"
+        .. (
+            object
+            and (" -> " .. object:GetFullName())
+            or ""
+        )
+end
+
+function TargetAssist:GetAimCenter()
+    Camera = Workspace.CurrentCamera
+
+    if not Camera then
+        return Vector2.new(0, 0)
+    end
+
+    if UIS.TouchEnabled then
+        local size = Camera.ViewportSize
+        return Vector2.new(
+            size.X / 2,
+            size.Y / 2
+        )
+    end
+
+    return UIS:GetMouseLocation()
+end
+
+function TargetAssist:GetPriorityScore(
+    model,
+    part,
+    screenDistance,
+    worldDistance
+)
+    local mode = State.Targeting.TargetPriority
+
+    if mode == "Distance" then
+        return worldDistance
+            + screenDistance * 0.05
+    end
+
+    if mode == "Lowest Health" then
+        local humanoid =
+            model:FindFirstChildOfClass("Humanoid")
+
+        local ratio = 1
+
+        if humanoid
+            and humanoid.MaxHealth > 0 then
+
+            ratio =
+                humanoid.Health
+                / humanoid.MaxHealth
+        end
+
+        return ratio * 1000
+            + screenDistance * 0.15
+    end
+
+    return screenDistance
 end
 
 function TargetAssist:FindTarget(center)
@@ -5928,31 +6846,81 @@ function TargetAssist:FindTarget(center)
         return nil
     end
 
+    local cameraPosition =
+        Camera.CFrame.Position
+
     local best = nil
-    local bestDistance = State.Targeting.FOV
+    local bestScore = math.huge
 
     for model, data in pairs(EntityESP.Objects) do
         if model.Parent
             and data.Root
             and data.Root.Parent
             and self:IsClassAllowed(data.Class)
-            and self:PassesTeamCheck(model, data.Class) then
+            and self:PassesTeamCheck(model, data.Class)
+            and self:IsAlive(model) then
 
-            local part = self:GetAimPart(model)
+            local aimPoint =
+                self:GetAimPart(model)
 
-            if part and part.Parent then
-                local point, visible = Camera:WorldToViewportPoint(part.Position)
+            local aimPosition =
+                aimPoint
+                and self:GetAimPosition(aimPoint)
 
-                if visible and point.Z > 0 then
-                    local screenDistance = (
-                        Vector2.new(point.X, point.Y) - center
-                    ).Magnitude
+            if aimPoint and aimPosition then
+                local worldDistance =
+                    (cameraPosition - aimPosition).Magnitude
 
-                    if screenDistance < bestDistance
-                        and self:HasLineOfSight(model, part) then
+                if worldDistance
+                    <= State.Targeting.MaxLockDistance then
 
-                        bestDistance = screenDistance
-                        best = part
+                    local screenPoint, visible =
+                        Camera:
+                        WorldToViewportPoint(
+                            aimPosition
+                        )
+
+                    if visible
+                        and screenPoint.Z > 0 then
+
+                        local screenDistance =
+                            (
+                                Vector2.new(
+                                    screenPoint.X,
+                                    screenPoint.Y
+                                )
+                                - center
+                            ).Magnitude
+
+                        if screenDistance
+                            <= State.Targeting.FOV
+                            and self:
+                                HasLineOfSight(
+                                    model,
+                                    aimPoint
+                                ) then
+
+                            local priority =
+                                self:
+                                GetPriorityScore(
+                                    model,
+                                    aimPoint,
+                                    screenDistance,
+                                    worldDistance
+                                )
+
+                            if priority < bestScore then
+                                bestScore = priority
+
+                                best = {
+                                    Model = model,
+                                    Part = aimPoint,
+                                    Class = data.Class,
+                                    ScreenDistance = screenDistance,
+                                    WorldDistance = worldDistance,
+                                }
+                            end
+                        end
                     end
                 end
             end
@@ -5962,60 +6930,452 @@ function TargetAssist:FindTarget(center)
     return best
 end
 
-connect(RunService.RenderStepped, function(dt)
+function TargetAssist:SetLock(target)
+    if not target then
+        return false
+    end
+
+    self.CurrentModel = target.Model
+    self.CurrentPart = target.Part
+    self.CurrentClass = target.Class
+    self.LastAcquire = os.clock()
+
+    self:UpdateMobileDock()
+
+    return true
+end
+
+function TargetAssist:ClearLock(_reason)
+    self.CurrentModel = nil
+    self.CurrentPart = nil
+    self.CurrentClass = nil
+
+    self:UpdateMobileDock()
+end
+
+function TargetAssist:ValidateCurrentLock()
+    local model = self.CurrentModel
+
+    if not model
+        or not model.Parent then
+        return nil
+    end
+
+    local class =
+        self.CurrentClass
+        or classifyEntity(model)
+
+    if not class
+        or not self:IsClassAllowed(class)
+        or not self:PassesTeamCheck(model, class)
+        or not self:IsAlive(model) then
+        return nil
+    end
+
+    local aimPoint =
+        self:GetAimPart(model)
+
+    if not self:IsAimPointValid(aimPoint) then
+        return nil
+    end
+
+    local aimPosition =
+        self:GetAimPosition(aimPoint)
+
+    if not aimPosition then
+        return nil
+    end
+
+    Camera = Workspace.CurrentCamera
+
+    if not Camera then
+        return nil
+    end
+
+    local distance =
+        (
+            Camera.CFrame.Position
+            - aimPosition
+        ).Magnitude
+
+    if distance
+        > State.Targeting.MaxLockDistance then
+        return nil
+    end
+
+    if not self:
+        HasLineOfSight(
+            model,
+            aimPoint
+        ) then
+        return nil
+    end
+
+    self.CurrentPart = aimPoint
+    self.CurrentClass = class
+
+    return aimPoint
+end
+
+function TargetAssist:AcquireLock()
+    local center = self:GetAimCenter()
+
+    local target =
+        self:FindTarget(center)
+
+    if not target then
+        -- Refresh once for late-spawned Humanoids / entities, then retry.
+        EntityTracker:ScanNearby()
+
+        target =
+            self:FindTarget(center)
+    end
+
+    if target then
+        return self:SetLock(target)
+    end
+
+    return false
+end
+
+function TargetAssist:ToggleManualLock()
+    if self.CurrentModel then
+        self:ClearLock("manual")
+        return
+    end
+
+    if not State.Targeting.Enabled then
+        if Toggles.TargetAssistEnabled
+            and Toggles.TargetAssistEnabled.SetValue then
+
+            Toggles.TargetAssistEnabled:SetValue(true)
+        else
+            State.Targeting.Enabled = true
+        end
+    end
+
+    if not self:AcquireLock() then
+        card(
+            "WARNING",
+            "Aim lock",
+            "No valid target inside the acquisition FOV.",
+            3
+        )
+    end
+end
+
+function TargetAssist:CyclePart()
+    local parts = {
+        "Auto",
+        "Head",
+        "Bone Head",
+        "HumanoidRootPart",
+        "Model Top",
+        "Model Center",
+    }
+
+    local index = 1
+
+    for i, value in ipairs(parts) do
+        if value == State.Targeting.TargetPart then
+            index = i
+            break
+        end
+    end
+
+    local nextPart =
+        parts[
+            (index % #parts) + 1
+        ]
+
+    State.Targeting.TargetPart = nextPart
+
+    if Options.TargetAssistPart
+        and Options.TargetAssistPart.SetValue then
+        Options.TargetAssistPart:SetValue(nextPart)
+    end
+
+    self.CurrentPart = nil
+end
+
+function TargetAssist:ToggleLockMode()
+    local nextMode =
+        State.Targeting.LockMode == "Hard"
+        and "Soft"
+        or "Hard"
+
+    State.Targeting.LockMode = nextMode
+
+    if Options.TargetAssistLockMode
+        and Options.TargetAssistLockMode.SetValue then
+        Options.TargetAssistLockMode:SetValue(nextMode)
+    end
+end
+
+function TargetAssist:FindEntityModelFromHit(hit)
+    local current = hit
+
+    for _ = 1, 8 do
+        if not current
+            or current == Workspace then
+            break
+        end
+
+        if current:IsA("Model") then
+            local data =
+                EntityESP.Objects[current]
+
+            local class =
+                data
+                and data.Class
+                or classifyEntity(current)
+
+            if class
+                and self:IsClassAllowed(class)
+                and self:PassesTeamCheck(current, class)
+                and self:IsAlive(current) then
+
+                return current, class
+            end
+        end
+
+        current = current.Parent
+    end
+
+    return nil
+end
+
+function TargetAssist:LockFromScreenPoint(screenPoint)
+    Camera = Workspace.CurrentCamera
+
+    if not Camera then
+        return false
+    end
+
+    local ray =
+        Camera:
+        ViewportPointToRay(
+            screenPoint.X,
+            screenPoint.Y
+        )
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {
+        LocalPlayer.Character,
+    }
+
+    local result =
+        Workspace:Raycast(
+            ray.Origin,
+            ray.Direction * State.Targeting.MaxLockDistance,
+            params
+        )
+
+    if not result then
+        return false
+    end
+
+    local model, class =
+        self:
+        FindEntityModelFromHit(
+            result.Instance
+        )
+
+    if not model then
+        return false
+    end
+
+    local aimPoint =
+        self:GetAimPart(model)
+
+    if not self:IsAimPointValid(aimPoint) then
+        return false
+    end
+
+    if not EntityESP.Objects[model] then
+        EntityESP:Add(model)
+    end
+
+    return self:
+        SetLock({
+            Model = model,
+            Part = aimPoint,
+            Class = class,
+        })
+end
+
+function TargetAssist:Update(dt)
     if not State.Running then
         return
     end
 
+    self:EnsureMobileDock()
+
     if State.Targeting.Enabled then
-        TargetAssist:EnsureGui()
+        self:EnsureGui()
     end
 
-    if TargetAssist.Circle then
-        local center
+    Camera = Workspace.CurrentCamera
 
-        Camera = Workspace.CurrentCamera
+    if not Camera then
+        return
+    end
 
-        if Library.IsMobile and Camera then
-            local size = Camera.ViewportSize
-            center = Vector2.new(size.X / 2, size.Y / 2)
-        else
-            center = UIS:GetMouseLocation()
+    local center = self:GetAimCenter()
+
+    if self.Circle then
+        self.Circle.Visible =
+            State.Targeting.Enabled
+            and State.Targeting.ShowFOV
+
+        self.Circle.Position =
+            UDim2.fromOffset(
+                center.X,
+                center.Y
+            )
+
+        self.Circle.Size =
+            UDim2.fromOffset(
+                State.Targeting.FOV * 2,
+                State.Targeting.FOV * 2
+            )
+    end
+
+    self:UpdateMobileDock()
+
+    if not State.Targeting.Enabled
+        or State.Freecam.Enabled then
+
+        return
+    end
+
+    -- Mobile never requires keyboard/mouse-button activation.
+    if State.Targeting.HoldRightMouse
+        and not UIS.TouchEnabled
+        and not UIS:
+            IsMouseButtonPressed(
+                Enum.UserInputType.MouseButton2
+            ) then
+
+        return
+    end
+
+    local part = nil
+
+    if State.Targeting.StickyLock
+        and self.CurrentModel then
+
+        part =
+            self:
+            ValidateCurrentLock()
+
+        if not part then
+            self:ClearLock("invalid")
         end
+    end
 
-        TargetAssist.Circle.Visible = State.Targeting.Enabled and State.Targeting.ShowFOV
-        TargetAssist.Circle.Position = UDim2.fromOffset(center.X, center.Y)
-        TargetAssist.Circle.Size = UDim2.fromOffset(
-            State.Targeting.FOV * 2,
-            State.Targeting.FOV * 2
+    if not State.Targeting.StickyLock then
+        self:ClearLock("dynamic")
+    end
+
+    if not part
+        and (
+            State.Targeting.AutoLock
+            or State.Targeting.AutoReacquire
+        ) then
+
+        local now = os.clock()
+
+        if now - self.LastAcquire >= 0.10 then
+            self.LastAcquire = now
+
+            self:AcquireLock()
+
+            part =
+                self:
+                ValidateCurrentLock()
+        end
+    end
+
+    if not part then
+        return
+    end
+
+    local aimPosition =
+        self:
+        GetAimPosition(part)
+
+    if not aimPosition then
+        self:ClearLock("aim point unavailable")
+        return
+    end
+
+    local cameraPosition =
+        Camera.CFrame.Position
+
+    if (aimPosition - cameraPosition).Magnitude
+        < 0.001 then
+        return
+    end
+
+    local desired =
+        CFrame.lookAt(
+            cameraPosition,
+            aimPosition,
+            Vector3.yAxis
         )
 
-        if not State.Targeting.Enabled
-            or State.Freecam.Enabled
-            or (
-                State.Targeting.HoldRightMouse
-                and not Library.IsMobile
-                and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-            ) then
-            return
-        end
-
-        local target = TargetAssist:FindTarget(center)
-
-        if target and Camera then
-            local desired = CFrame.lookAt(
-                Camera.CFrame.Position,
-                target.Position
+    if State.Targeting.LockMode == "Hard" then
+        -- True camera lock: this runs after the standard Camera render step.
+        Camera.CFrame = desired
+    else
+        local alpha =
+            1
+            - math.exp(
+                -math.max(
+                    State.Targeting.Smoothness,
+                    0.01
+                )
+                * 28
+                * dt
             )
 
-            local alpha = 1 - math.exp(
-                -math.max(State.Targeting.Smoothness, 0.01) * 28 * dt
+        Camera.CFrame =
+            Camera.CFrame:
+            Lerp(
+                desired,
+                clamp(alpha, 0, 1)
             )
+    end
+end
 
-            Camera.CFrame = Camera.CFrame:Lerp(desired, clamp(alpha, 0, 1))
-        end
+RunService:BindToRenderStep(
+    TARGET_RENDER_BIND,
+    Enum.RenderPriority.Camera.Value + 50,
+    function(dt)
+        TargetAssist:Update(dt)
+    end
+)
+
+connect(UIS.TouchTap, function(touchPositions, processedByUI)
+    if processedByUI
+        or not State.Running
+        or not State.Targeting.Enabled
+        or not State.Targeting.TapToLock
+        or not UIS.TouchEnabled then
+        return
+    end
+
+    local point = touchPositions[1]
+
+    if point then
+        TargetAssist:
+            LockFromScreenPoint(point)
     end
 end)
+
+TargetAssist:EnsureMobileDock()
 
 --========================================================
 -- RUNTIME CONSOLE
@@ -6652,23 +8012,34 @@ RadarBox:AddSlider(
 
 local AimBox = Tabs.Utility:AddGroupbox({
     Side = "Right",
-    Name = "Camera target assist",
-    Description = "FOV tracking with wall check and player team filtering",
+    Name = "Aim Lock",
+    Description = "Sticky camera lock with mobile controls and exact part targeting",
     IconName = "crosshair",
 })
 
 AimBox:AddToggle(
     "TargetAssistEnabled",
     {
-        Text = "Camera target assist",
+        Text = "Enable Aim Lock",
         Default = false,
+        Tooltip = "Mobile activates directly from the floating AIM button. No key hold is required.",
 
         Callback = function(value)
             State.Targeting.Enabled = value
 
             if value then
                 EntityTracker:ScanNearby()
+
+                if State.Targeting.AutoLock then
+                    task.defer(function()
+                        TargetAssist:AcquireLock()
+                    end)
+                end
+            else
+                TargetAssist:ClearLock("disabled")
             end
+
+            TargetAssist:UpdateMobileDock()
         end,
     }
 )
@@ -6689,6 +8060,8 @@ AimBox:AddDropdown(
 
         Callback = function(value)
             State.Targeting.TargetClass = value
+            TargetAssist:ClearLock("class changed")
+            EntityTracker:ScanNearby()
         end,
     }
 )
@@ -6698,10 +8071,11 @@ AimBox:AddToggle(
     {
         Text = "Team check",
         Default = true,
-        Tooltip = "When targeting Players, teammates are ignored. Monsters and NPCs are unaffected.",
+        Tooltip = "When targeting Players, teammates are ignored. NPCs and Monsters are unaffected.",
 
         Callback = function(value)
             State.Targeting.TeamCheck = value
+            TargetAssist:ClearLock("team check changed")
         end,
     }
 )
@@ -6709,17 +8083,101 @@ AimBox:AddToggle(
 AimBox:AddDropdown(
     "TargetAssistPart",
     {
-        Text = "Target part",
+        Text = "Smart target point",
         Values = {
+            "Auto",
             "Head",
             "HumanoidRootPart",
             "UpperTorso",
+            "LowerTorso",
+            "Bone Head",
+            "Attachment Head",
+            "Model Top",
+            "Model Center",
+            "PrimaryPart",
+            "Nearest Part",
         },
-        Default = "Head",
+        Default = "Auto",
         Multi = false,
+        Tooltip = "Auto supports normal Roblox rigs, Blender bones, attachments and one-piece MeshPart models.",
 
         Callback = function(value)
             State.Targeting.TargetPart = value
+            TargetAssist.CurrentPart = nil
+            TargetAssist:UpdateMobileDock()
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetAssistStrictPart",
+    {
+        Text = "Require selected exact point",
+        Default = true,
+        Tooltip = "Applies to explicit Head/Root/Torso/Bone/Attachment/Primary selections. Auto always chooses the best available point.",
+
+        Callback = function(value)
+            State.Targeting.StrictPart = value
+            TargetAssist.CurrentPart = nil
+        end,
+    }
+)
+
+AimBox:AddSlider(
+    "TargetAssistModelTopOffset",
+    {
+        Text = "Model-top height",
+        Default = 32,
+        Min = 10,
+        Max = 48,
+        Rounding = 0,
+        Suffix = "%",
+        Tooltip = "Height above the model center used by Model Top and Auto fallback for custom Blender meshes.",
+
+        Callback = function(value)
+            State.Targeting.ModelTopOffset = value / 100
+            TargetAssist.CurrentPart = nil
+        end,
+    }
+)
+
+AimBox:AddDropdown(
+    "TargetAssistLockMode",
+    {
+        Text = "Lock mode",
+        Values = {
+            "Hard",
+            "Soft",
+        },
+        Default = "Hard",
+        Multi = false,
+        Tooltip = "Hard writes the final camera CFrame after the Roblox camera update. Soft interpolates toward the part.",
+
+        Callback = function(value)
+            State.Targeting.LockMode = value
+            TargetAssist:UpdateMobileDock()
+        end,
+    }
+)
+
+AimBox:AddDropdown(
+    "TargetAssistPriority",
+    {
+        Text = "Target priority",
+        Values = {
+            "Crosshair",
+            "Distance",
+            "Lowest Health",
+        },
+        Default = "Crosshair",
+        Multi = false,
+
+        Callback = function(value)
+            State.Targeting.TargetPriority = value
+
+            if not State.Targeting.StickyLock then
+                TargetAssist:ClearLock("priority changed")
+            end
         end,
     }
 )
@@ -6727,12 +8185,13 @@ AimBox:AddDropdown(
 AimBox:AddSlider(
     "TargetAssistFOV",
     {
-        Text = "FOV radius",
+        Text = "Acquisition FOV",
         Default = 165,
-        Min = 35,
-        Max = 500,
+        Min = 30,
+        Max = 650,
         Rounding = 0,
         Suffix = " px",
+        Tooltip = "FOV is used only to acquire a target. Sticky Lock can keep it after acquisition.",
 
         Callback = function(value)
             State.Targeting.FOV = value
@@ -6741,16 +8200,72 @@ AimBox:AddSlider(
 )
 
 AimBox:AddSlider(
+    "TargetAssistMaxDistance",
+    {
+        Text = "Maximum lock distance",
+        Default = 2500,
+        Min = 100,
+        Max = 8000,
+        Rounding = 0,
+        Suffix = " studs",
+
+        Callback = function(value)
+            State.Targeting.MaxLockDistance = value
+        end,
+    }
+)
+
+AimBox:AddSlider(
     "TargetAssistSmooth",
     {
-        Text = "Smoothness",
+        Text = "Soft-lock speed",
         Default = 0.22,
         Min = 0.03,
         Max = 1,
         Rounding = 2,
+        Tooltip = "Used only when Lock Mode is Soft.",
 
         Callback = function(value)
             State.Targeting.Smoothness = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetAssistSticky",
+    {
+        Text = "Sticky lock",
+        Default = true,
+        Tooltip = "Keeps the acquired model locked instead of selecting a new target every frame.",
+
+        Callback = function(value)
+            State.Targeting.StickyLock = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetAssistAutoLock",
+    {
+        Text = "Auto lock",
+        Default = true,
+        Tooltip = "Automatically acquires the best valid target inside the FOV.",
+
+        Callback = function(value)
+            State.Targeting.AutoLock = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
+    "TargetAssistAutoReacquire",
+    {
+        Text = "Auto reacquire",
+        Default = true,
+        Tooltip = "When the locked target becomes invalid, automatically acquires another valid target.",
+
+        Callback = function(value)
+            State.Targeting.AutoReacquire = value
         end,
     }
 )
@@ -6768,10 +8283,40 @@ AimBox:AddToggle(
 )
 
 AimBox:AddToggle(
+    "TargetAssistPrediction",
+    {
+        Text = "Motion prediction",
+        Default = false,
+        Tooltip = "Optional velocity compensation. Leave disabled for exact current-part lock.",
+
+        Callback = function(value)
+            State.Targeting.Prediction = value
+        end,
+    }
+)
+
+AimBox:AddSlider(
+    "TargetAssistPredictionTime",
+    {
+        Text = "Prediction time",
+        Default = 0.08,
+        Min = 0,
+        Max = 0.30,
+        Rounding = 2,
+        Suffix = "s",
+
+        Callback = function(value)
+            State.Targeting.PredictionTime = value
+        end,
+    }
+)
+
+AimBox:AddToggle(
     "TargetAssistHoldMouse",
     {
-        Text = "Hold right mouse to track",
-        Default = true,
+        Text = "Desktop: require right mouse",
+        Default = not UIS.TouchEnabled,
+        Tooltip = "Ignored on mobile. Disable this on desktop if you also want always-on tracking.",
 
         Callback = function(value)
             State.Targeting.HoldRightMouse = value
@@ -6782,7 +8327,7 @@ AimBox:AddToggle(
 AimBox:AddToggle(
     "TargetAssistShowFOV",
     {
-        Text = "Show FOV circle",
+        Text = "Show acquisition FOV",
         Default = true,
 
         Callback = function(value)
@@ -6790,6 +8335,138 @@ AimBox:AddToggle(
         end,
     }
 )
+
+AimBox:AddButton({
+    Text = "Lock target now",
+
+    Func = function()
+        if not State.Targeting.Enabled then
+            if Toggles.TargetAssistEnabled
+                and Toggles.TargetAssistEnabled.SetValue then
+
+                Toggles.TargetAssistEnabled:SetValue(true)
+            else
+                State.Targeting.Enabled = true
+            end
+        end
+
+        if not TargetAssist:AcquireLock() then
+            card(
+                "WARNING",
+                "Aim Lock",
+                "No valid target is inside the acquisition FOV.",
+                4
+            )
+        end
+    end,
+})
+
+AimBox:AddButton({
+    Text = "Clear current lock",
+
+    Func = function()
+        TargetAssist:ClearLock("manual")
+    end,
+})
+
+AimBox:AddButton({
+    Text = "Inspect resolved target point",
+
+    Func = function()
+        local model = TargetAssist.CurrentModel
+
+        if not model or not model.Parent then
+            card(
+                "INFO",
+                "Smart Target Point",
+                "No target is currently locked.",
+                4
+            )
+            return
+        end
+
+        local point =
+            TargetAssist:
+            GetAimPart(model)
+
+        card(
+            "INFO",
+            "Smart Target Point",
+            model.Name
+                .. "\n"
+                .. TargetAssist:
+                    DescribeAimPoint(point),
+            7
+        )
+    end,
+})
+
+local MobileAimBox = Tabs.Utility:AddGroupbox({
+    Side = "Right",
+    Name = "Mobile Aim Controls",
+    Description = "Touch-first controls - no keyboard or mouse button required",
+    IconName = "smartphone",
+})
+
+MobileAimBox:AddToggle(
+    "MobileAimDock",
+    {
+        Text = "Floating aim dock",
+        Default = true,
+        Tooltip = "Shows AIM, LOCK, PART and HARD/SOFT buttons on touch devices.",
+
+        Callback = function(value)
+            State.Targeting.MobileControls = value
+
+            if value then
+                TargetAssist:EnsureMobileDock()
+            else
+                TargetAssist:DestroyMobileDock()
+            end
+        end,
+    }
+)
+
+MobileAimBox:AddToggle(
+    "MobileTapToLock",
+    {
+        Text = "Tap target to lock",
+        Default = false,
+        Tooltip = "When Aim Lock is enabled, tapping a valid entity can select it directly.",
+
+        Callback = function(value)
+            State.Targeting.TapToLock = value
+        end,
+    }
+)
+
+MobileAimBox:AddSlider(
+    "MobileAimDockScale",
+    {
+        Text = "Floating dock size",
+        Default = 100,
+        Min = 75,
+        Max = 140,
+        Rounding = 0,
+        Suffix = "%",
+
+        Callback = function(value)
+            State.Targeting.MobileDockScale = value / 100
+            TargetAssist:UpdateMobileDock()
+        end,
+    }
+)
+
+MobileAimBox:AddLabel({
+    Text =
+        "Mobile controls:\n"
+        .. "AIM = enable/disable\n"
+        .. "LOCK = acquire/clear target\n"
+        .. "PART = cycle Auto/Head/Bone/Root/Top/Center\n"
+        .. "HARD/SOFT = change lock mode\n"
+        .. "Drag the status bar to move the dock.",
+    DoesWrap = true,
+})
 
 
 local XRayBox = Tabs.Utility:AddGroupbox({
@@ -9031,23 +10708,44 @@ local ChangelogLeft =
     })
 
 ChangelogLeft:AddLabel({
-    Text =
-        "NEW\n"
-        .. "- Flight and Freecam\n"
-        .. "- Click teleport and click-to-walk\n"
-        .. "- Persistent waypoints\n"
-        .. "- Player/NPC target travel, spectate and attach\n"
-        .. "- Player/monster radar and screen tracers\n"
-        .. "- Camera target assist with FOV and wall check\n"
-        .. "- Local X-Ray and hazard sandbox\n"
-        .. "- Macro recorder with save/load\n"
-        .. "- Reaction lab with learned animation rules\n"
-        .. "- Anti-AFK, Auto-use Tool and Auto Chat\n"
-        .. "- Server panel, watchlist and server hop\n"
-        .. "- Streamer mode, custom cursor and music player\n"
-        .. "- Runtime console and FPS cap controls",
-    DoesWrap = true,
+    Text = "NEW",
+    DoesWrap = false,
 })
+
+local NewChanges = {
+    "Smart Target Point for normal rigs and Blender/custom models",
+    "Direct support for Bone.WorldPosition and Attachment.WorldPosition",
+    "BoundingBox Model Top and Model Center aim points",
+    "Auto fallback for one-piece MeshPart monsters",
+    "Tagged Monster/NPC models can be detected without Humanoid",
+    "Aim-point inspector showing the resolved source",
+    "Hard Aim Lock bound after the Roblox camera render step",
+    "Sticky target retention and automatic reacquisition",
+    "Exact Head / Root / UpperTorso / LowerTorso selection",
+    "Crosshair, Distance and Lowest Health target priorities",
+    "Mobile floating AIM / LOCK / PART / MODE dock",
+    "Optional tap-target-to-lock on touch devices",
+    "Maximum lock distance and optional motion prediction",
+    "Flight and Freecam",
+    "Click teleport and click-to-walk",
+    "Persistent waypoints",
+    "Player/NPC target travel, spectate and attach",
+    "Player/monster radar and screen tracers",
+    "Local X-Ray and hazard sandbox",
+    "Macro recorder with save/load",
+    "Reaction lab with learned animation rules",
+    "Anti-AFK, Auto-use Tool and Auto Chat",
+    "Server panel, watchlist and server hop",
+    "Streamer mode, custom cursor and music player",
+    "Runtime console and FPS cap controls",
+}
+
+for _, change in ipairs(NewChanges) do
+    ChangelogLeft:AddLabel({
+        Text = "- " .. change,
+        DoesWrap = true,
+    })
+end
 
 ChangelogLeft:AddDivider()
 
@@ -9057,6 +10755,11 @@ ChangelogLeft:AddLabel({
 })
 
 local ImprovedChanges = {
+    "Auto aim-point resolver now prefers Head, Bone, Attachment, Root, PrimaryPart and model bounds",
+    "Mobile PART button cycles smart universal target presets",
+    "Mobile UI now uses larger touch targets and 100% DPI by default",
+    "Aim Lock no longer requires a key or mouse hold on mobile",
+    "Hard Lock stays on the selected BasePart after acquisition",
     "Player Team Check for camera target assist",
     "ASCII-only user-facing text",
     "Separate Monster and NPC ESP identities",
@@ -9464,7 +11167,7 @@ task.spawn(function()
     card(
         "SYSTEM",
         "Nuvem Hub",
-        "Major update loaded.\nTeam Check, polished changelog and magic branding are active.",
+        "Major update loaded.\nSmart Target Point now supports Roblox rigs, Blender bones and custom meshes.",
         6
     )
 end)
@@ -9511,4 +11214,4 @@ _G.__NUVEM_HUB = {
     end,
 }
 
-print("i love frieren lol.")
+print("[Nuvem Hub] major update loaded.")
